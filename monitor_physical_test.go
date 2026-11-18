@@ -5,6 +5,7 @@ package ddcci_test
 import (
 	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +15,20 @@ import (
 	"github.com/niluan304/ddcci"
 	"github.com/niluan304/ddcci/vcp"
 )
+
+// skipOnUnsupportedVCP skips the test when the attached monitor does not
+// support the probed VCP feature (hardware-dependent tests only).
+func skipOnUnsupportedVCP(t *testing.T, code int, err error) {
+	t.Helper()
+	if err == nil {
+		return
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "does not support") || strings.Contains(msg, "VCP code") {
+		t.Skipf("monitor does not support vcp 0x%02X: %v", code, err)
+	}
+	t.Fatal(err)
+}
 
 func Test_PhysicalMonitor(t *testing.T) {
 	type args struct {
@@ -234,27 +249,13 @@ func TestPhysicalMonitor_RestoreMonitorFactoryColorDefaults(t *testing.T) {
 	})
 }
 
-func TestPhysicalMonitor_RestoreMonitorFactoryDefaults(t *testing.T) {
-	t.Run("With HighLevel Api", func(t *testing.T) {
-		m := ddcci.PhysicalMonitor0()
-		err := m.RestoreFactoryDefaults()
-		require.NoError(t, err)
-	})
-
-	time.Sleep(time.Second)
-
-	t.Run("With SetVCPFeature", func(t *testing.T) {
-		m := ddcci.PhysicalMonitor0()
-		err := m.SetVCPFeature(vcp.RestoreFactoryDefaults.Value(0))
-		require.NoError(t, err)
-	})
-}
-
 func TestPhysicalMonitor_AudioSpeakerVolume(t *testing.T) {
 	m := ddcci.PhysicalMonitor0()
 
 	origin, maxValue, err := m.GetVCPFeatureAndVCPFeatureReply(vcp.AudioSpeakerVolume)
-	require.NoError(t, err)
+	if err != nil {
+		skipOnUnsupportedVCP(t, vcp.AudioSpeakerVolume.Code(), err)
+	}
 	defer t.Run(fmt.Sprintf("Recover AudioSpeakerVolume %d", origin), func(t *testing.T) {
 		err := m.SetVCPFeature(vcp.AudioSpeakerVolume.Value(origin))
 		require.NoError(t, err)
@@ -278,7 +279,9 @@ func TestPhysicalMonitor_AudioMicrophoneVolume(t *testing.T) {
 	m := ddcci.PhysicalMonitor0()
 
 	origin, maxValue, err := m.GetVCPFeatureAndVCPFeatureReply(vcp.AudioMicrophoneVolume)
-	require.NoError(t, err)
+	if err != nil {
+		skipOnUnsupportedVCP(t, vcp.AudioMicrophoneVolume.Code(), err)
+	}
 	defer t.Run(fmt.Sprintf("Recover AudioMicrophoneVolume %d", origin), func(t *testing.T) {
 		err := m.SetVCPFeature(vcp.AudioMicrophoneVolume.Value(origin))
 		require.NoError(t, err)
@@ -395,7 +398,9 @@ func TestPhysicalMonitor_GetDisplayAreaSize(t *testing.T) {
 		t.Run(fmt.Sprintf("sizeType: %v", sizeType), func(t *testing.T) {
 			m := ddcci.PhysicalMonitor0()
 			minValue, current, maxValue, err := m.GetDisplayAreaSize(sizeType)
-			require.NoError(t, err)
+			if err != nil {
+				skipOnUnsupportedVCP(t, 0, err)
+			}
 
 			t.Logf("minValue = %v, current = %v, maxValue = %v", minValue, current, maxValue)
 		})

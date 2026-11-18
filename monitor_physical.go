@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"syscall"
+	"time"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 
 	"github.com/niluan304/ddcci/vcp"
 )
@@ -19,14 +21,22 @@ import (
 //
 // [microsoft-windows doc]: https://learn.microsoft.com/en-us/windows/win32/api/physicalmonitorenumerationapi/ns-physicalmonitorenumerationapi-physical_monitor
 type PhysicalMonitor struct {
-	dxva2 *syscall.DLL
-
 	// Handle to the physical monitor.
-	handle syscall.Handle
+	handle windows.Handle
 
 	// Text description of the physical monitor.
 	// A physical monitor description is always an array of 128 characters.
 	description string
+}
+
+// physicalMonitorRaw matches the Windows PHYSICAL_MONITOR struct.
+type physicalMonitorRaw struct {
+	// Handle to the physical monitor.
+	hPhysicalMonitor windows.Handle
+
+	// Text description of the physical monitor.
+	// A physical monitor description is always an array of 128 characters.
+	szPhysicalMonitorDescription [128]uint16
 }
 
 // Description Text description of the physical monitor.
@@ -35,8 +45,27 @@ func (m *PhysicalMonitor) Description() string {
 	return m.description
 }
 
-// NewPhysicalMonitor
-// Retrieves the physical monitors associated with an HMONITOR monitor handle.
+// Close destroys the underlying physical monitor handle.
+// It is safe to call Close multiple times; later calls are no-ops.
+// The monitor no longer accepts commands after Close returns.
+func (m *PhysicalMonitor) Close() error {
+	if m == nil || m.handle == 0 {
+		return nil
+	}
+
+	proc := procDestroyPhysicalMonitor
+	r1, _, errno := proc.Call(uintptr(m.handle))
+	if r1 == 0 {
+		return errors.Join(errno, errors.New("DestroyPhysicalMonitor fail to call"))
+	}
+
+	m.handle = 0
+	return nil
+}
+
+// NewPhysicalMonitors
+// Retrieves all physical monitors associated with an HMONITOR monitor handle.
+// The caller is responsible for closing the returned monitors with Close.
 //
 // [in] hMonitor
 // A monitor handle. PhysicalMonitor handles are returned by
@@ -46,14 +75,19 @@ func (m *PhysicalMonitor) Description() string {
 //
 // [out] pPhysicalMonitorArray
 // Pointer to an array of PHYSICAL_MONITOR structures. The caller must allocate the array.
-func NewPhysicalMonitor(m *SystemMonitor) (*PhysicalMonitor, error) {
+func NewPhysicalMonitors(m *SystemMonitor) ([]*PhysicalMonitor, error) {
 	num, err := m.GetNumberOfPhysicalMonitorsFromHMONITOR()
 	if err != nil {
 		return nil, err
 	}
+	if num <= 0 {
+		num = 1
+	}
 
-	data := make([]byte, 128)
-	err = m.dxva2Call(GetPhysicalMonitorsFromHMONITOR,
+	// PHYSICAL_MONITOR is `HANDLE + WCHAR[128]` (264 bytes on 64-bit).
+	// Passing a buffer smaller than that lets the callee write out of bounds.
+	data := make([]physicalMonitorRaw, num)
+	err = m.dxva2Call(procGetPhysicalMonitorsFromHMONITOR,
 		uintptr(num),
 		uintptr(unsafe.Pointer(&data[0])),
 	)
@@ -61,15 +95,31 @@ func NewPhysicalMonitor(m *SystemMonitor) (*PhysicalMonitor, error) {
 		return nil, err
 	}
 
-	description := slices.DeleteFunc(data[8:], func(b byte) bool {
-		return b == 0
-	})
+	monitors := make([]*PhysicalMonitor, 0, num)
+	for i := range data {
+		monitors = append(monitors, &PhysicalMonitor{
+			handle:      data[i].hPhysicalMonitor,
+			description: windows.UTF16ToString(data[i].szPhysicalMonitorDescription[:]),
+		})
+	}
+	return monitors, nil
+}
 
-	return &PhysicalMonitor{
-		dxva2:       m.dxva2,
-		handle:      syscall.Handle(data[0]),
-		description: string(description),
-	}, nil
+// NewPhysicalMonitor
+// Retrieves the first physical monitor associated with an HMONITOR monitor handle.
+// Additional physical monitors (rare, e.g. some KVM or splitter setups) are
+// released automatically, so the caller must Close the returned monitor.
+func NewPhysicalMonitor(m *SystemMonitor) (*PhysicalMonitor, error) {
+	monitors, err := NewPhysicalMonitors(m)
+	if err != nil {
+		return nil, err
+	}
+
+	first := monitors[0]
+	for _, extra := range monitors[1:] {
+		_ = extra.Close()
+	}
+	return first, nil
 }
 
 // PhysicalMonitor0
@@ -90,23 +140,25 @@ func PhysicalMonitor0() *PhysicalMonitor {
 	return m
 }
 
-// short name: m.dxva2.FindProc(name).Call(m.handle, args...)
-func (m *PhysicalMonitor) call(name string, args ...uintptr) error {
-	proc, err := m.dxva2.FindProc(name)
-	if err != nil {
-		return errors.Join(err, fmt.Errorf("dxva2 fail to load proc(%s)", name))
-	}
-
+// call dxva2 function, where the first argument is the physical monitor handle.
+// The DDC/CI bus is unreliable; a single failed call is retried once after 100ms.
+func (m *PhysicalMonitor) call(proc *windows.LazyProc, args ...uintptr) error {
 	args = slices.Insert(args, 0, uintptr(m.handle))
-	r1, r2, errno := proc.Call(args...)
-	if !errors.Is(errno, errno0) {
-		return errors.Join(errno, fmt.Errorf("proc(%s) fail to call(%v)", name, args))
+
+	var err error
+	for range 2 {
+		r1, r2, errno := proc.Call(args...)
+		if errors.Is(errno, errno0) {
+			_ = r1
+			_ = r2
+
+			return nil
+		}
+		err = errors.Join(errno, fmt.Errorf("proc(%s) fail to call(%v)", proc.Name, args))
+		time.Sleep(100 * time.Millisecond)
 	}
 
-	_ = r1
-	_ = r2
-
-	return nil
+	return err
 }
 
 // GetVCPFeatureAndVCPFeatureReply
@@ -127,32 +179,17 @@ func (m *PhysicalMonitor) call(name string, args ...uintptr) error {
 // If vcpCode specifies a non-continuous VCP code, the value received in this parameter is undefined.
 // This parameter can be NULL.
 func (m *PhysicalMonitor) GetVCPFeatureAndVCPFeatureReply(coder vcp.Coder) (current, maxValue int, err error) {
-	// type vcpCodeType int
-	// const (
-	//	// Momentary VCP code. Sending a command of this type causes the monitor to initiate a self-timed operation
-	//	// and then revert to its original state. Examples include display tests and degaussing.
-	//	Momentary vcpCodeType = iota
-	//	// SetParameter Set Parameter VCP code.
-	//	// Sending a command of this type changes some aspect of the monitor's operation.
-	//	SetParameter
-	// )
-
 	// [out] pvct
 	//
 	// Receives the VCP code type, as a member of the MC_VCP_CODE_TYPE enumeration.
 	// This parameter can be NULL.
 	codeType := 0
 
-	// // Confuse:
-	// // unable to get minValue from GetVCPFeatureAndVCPFeatureReply
-	// minValue := 99
-
-	err = m.call(GetVCPFeatureAndVCPFeatureReply,
+	err = m.call(procGetVCPFeatureAndVCPFeatureReply,
 		uintptr(coder.Code()),
 		uintptr(unsafe.Pointer(&codeType)),
 		uintptr(unsafe.Pointer(&current)),
 		uintptr(unsafe.Pointer(&maxValue)),
-		// uintptr(unsafe.Pointer(&minValue)),
 	)
 	if err != nil {
 		return 0, 0, err
@@ -179,7 +216,7 @@ func (m *PhysicalMonitor) GetVCPFeatureAndVCPFeatureReply(coder vcp.Coder) (curr
 // If the function fails, the return value is FALSE.
 // To get extended error information, call GetLastError.
 func (m *PhysicalMonitor) SetVCPFeature(code vcp.VCP) error {
-	err := m.call(SetVCPFeature,
+	err := m.call(procSetVCPFeature,
 		uintptr(code.Code()),
 		uintptr(code.Value()),
 	)
@@ -202,13 +239,13 @@ func (m *PhysicalMonitor) SetVCPFeature(code vcp.VCP) error {
 // [out] pdwMaximumBrightness
 // Receives the monitor's maximum brightness.
 func (m *PhysicalMonitor) GetBrightness() (minValue, current, maxValue int, err error) {
-	err = m.call(GetMonitorBrightness,
+	err = m.call(procGetMonitorBrightness,
 		uintptr(unsafe.Pointer(&minValue)),
 		uintptr(unsafe.Pointer(&current)),
 		uintptr(unsafe.Pointer(&maxValue)),
 	)
 
-	return
+	return minValue, current, maxValue, err
 }
 
 // GetCapabilities
@@ -222,12 +259,12 @@ func (m *PhysicalMonitor) GetBrightness() (minValue, current, maxValue int, err 
 // [out] pdwSupportedColorTemperatures
 // Receives a bitwise OR of color temperature flags. See Remarks.
 func (m *PhysicalMonitor) GetCapabilities() (capabilities, supportedColorTemperatures int, err error) {
-	err = m.call(GetMonitorCapabilities,
+	err = m.call(procGetMonitorCapabilities,
 		uintptr(unsafe.Pointer(&capabilities)),
 		uintptr(unsafe.Pointer(&supportedColorTemperatures)),
 	)
 
-	return
+	return capabilities, supportedColorTemperatures, err
 }
 
 // GetColorTemperature
@@ -237,11 +274,11 @@ func (m *PhysicalMonitor) GetCapabilities() (capabilities, supportedColorTempera
 // Receives the monitor's current color temperature,
 // specified as a member of the MC_COLOR_TEMPERATURE enumeration.
 func (m *PhysicalMonitor) GetColorTemperature() (current int, err error) {
-	err = m.call(GetMonitorColorTemperature,
+	err = m.call(procGetMonitorColorTemperature,
 		uintptr(unsafe.Pointer(&current)),
 	)
 
-	return
+	return current, err
 }
 
 // GetContrast
@@ -256,13 +293,13 @@ func (m *PhysicalMonitor) GetColorTemperature() (current int, err error) {
 // [out] pdwMaximumContrast
 // Receives the monitor's maximum contrast.
 func (m *PhysicalMonitor) GetContrast() (minValue, current, maxValue int, err error) {
-	err = m.call(GetMonitorContrast,
+	err = m.call(procGetMonitorContrast,
 		uintptr(unsafe.Pointer(&minValue)),
 		uintptr(unsafe.Pointer(&current)),
 		uintptr(unsafe.Pointer(&maxValue)),
 	)
 
-	return
+	return minValue, current, maxValue, err
 }
 
 type PositionType int
@@ -289,14 +326,14 @@ const (
 // [out] pdwMaximumPosition
 // Receives the maximum horizontal or vertical position.
 func (m *PhysicalMonitor) GetDisplayAreaPosition(positionType PositionType) (minValue, current, maxValue int, err error) {
-	err = m.call(GetMonitorDisplayAreaPosition,
+	err = m.call(procGetMonitorDisplayAreaPosition,
 		uintptr(positionType),
 		uintptr(unsafe.Pointer(&minValue)),
 		uintptr(unsafe.Pointer(&current)),
 		uintptr(unsafe.Pointer(&maxValue)),
 	)
 
-	return
+	return minValue, current, maxValue, err
 }
 
 type SizeType int
@@ -317,14 +354,14 @@ const (
 // [out] pdwMaximumWidthOrHeight
 // Receives the maximum width or height.
 func (m *PhysicalMonitor) GetDisplayAreaSize(sizeType SizeType) (minValue, current, maxValue int, err error) {
-	err = m.call(GetMonitorDisplayAreaSize,
+	err = m.call(procGetMonitorDisplayAreaSize,
 		uintptr(sizeType),
 		uintptr(unsafe.Pointer(&minValue)),
 		uintptr(unsafe.Pointer(&current)),
 		uintptr(unsafe.Pointer(&maxValue)),
 	)
 
-	return
+	return minValue, current, maxValue, err
 }
 
 type DriveType int
@@ -342,47 +379,47 @@ const (
 // A member of the McDriveType enumeration, specifying whether to retrieve the red, green, or blue drive value.
 //
 // [out] pdwMinimumDrive
-// Receives the minimum red, green, or blue drive value.
+// Receives the monitor's minimum red, green, or blue drive value.
 //
 // [out] pdwCurrentDrive
-// Receives the current red, green, or blue drive value.
+// Receives the monitor's current red, green, or blue drive value.
 //
 // [out] pdwMaximumDrive
-// Receives the maximum red, green, or blue drive value.
+// Receives the monitor's maximum red, green, or blue drive value.
 func (m *PhysicalMonitor) GetRedGreenOrBlueDrive(driveType DriveType) (minValue, current, maxValue int, err error) {
-	err = m.call(GetMonitorRedGreenOrBlueDrive,
+	err = m.call(procGetMonitorRedGreenOrBlueDrive,
 		uintptr(driveType),
 		uintptr(unsafe.Pointer(&minValue)),
 		uintptr(unsafe.Pointer(&current)),
 		uintptr(unsafe.Pointer(&maxValue)),
 	)
 
-	return
+	return minValue, current, maxValue, err
 }
 
 // GetRedGreenOrBlueGain
 // Retrieves a monitor's red, green, or blue gain value.
 //
 // [in] dtDriveType
-// A member of the McDriveType enumeration, specifying whether to retrieve the red, green, or blue drive value.
+// A member of the McDriveType enumeration, specifying whether to retrieve the red, green, or blue gain value.
 //
 // [out] pdwMinimumGain
-// Receives the minimum red, green, or blue gain value.
+// Receives the monitor's minimum red, green, or blue gain value.
 //
 // [out] pdwCurrentGain
-// Receives the current red, green, or blue gain value.
+// Receives the monitor's current red, green, or blue gain value.
 //
 // [out] pdwMaximumGain
-// Receives the maximum red, green, or blue gain value.
+// Receives the monitor's maximum red, green, or blue gain value.
 func (m *PhysicalMonitor) GetRedGreenOrBlueGain(driveType DriveType) (minValue, current, maxValue int, err error) {
-	err = m.call(GetMonitorRedGreenOrBlueGain,
+	err = m.call(procGetMonitorRedGreenOrBlueGain,
 		uintptr(driveType),
 		uintptr(unsafe.Pointer(&minValue)),
 		uintptr(unsafe.Pointer(&current)),
 		uintptr(unsafe.Pointer(&maxValue)),
 	)
 
-	return
+	return minValue, current, maxValue, err
 }
 
 // GetTechnologyType
@@ -390,18 +427,18 @@ func (m *PhysicalMonitor) GetRedGreenOrBlueGain(driveType DriveType) (minValue, 
 // [out] pdtyDisplayTechnologyType
 // Receives the technology type, specified as a member of the MC_DISPLAY_TECHNOLOGY_TYPE enumeration.
 func (m *PhysicalMonitor) GetTechnologyType() (value int, err error) {
-	err = m.call(GetMonitorTechnologyType,
+	err = m.call(procGetMonitorTechnologyType,
 		uintptr(unsafe.Pointer(&value)),
 	)
 
-	return
+	return value, err
 }
 
 // Degauss
 // Degausses a monitor.
 // Degaussing improves a monitor's image quality and color fidelity by demagnetizing the monitor.
 func (m *PhysicalMonitor) Degauss() error {
-	err := m.call(DegaussMonitor)
+	err := m.call(procDegaussMonitor)
 	if err != nil {
 		return err
 	}
@@ -412,7 +449,7 @@ func (m *PhysicalMonitor) Degauss() error {
 // RestoreFactoryColorDefaults
 // Restores a monitor's color settings to their factory defaults.
 func (m *PhysicalMonitor) RestoreFactoryColorDefaults() error {
-	err := m.call(RestoreMonitorFactoryColorDefaults)
+	err := m.call(procRestoreMonitorFactoryColorDefaults)
 	if err != nil {
 		return err
 	}
@@ -423,7 +460,7 @@ func (m *PhysicalMonitor) RestoreFactoryColorDefaults() error {
 // RestoreFactoryDefaults
 // Restores a monitor's settings to their factory defaults.
 func (m *PhysicalMonitor) RestoreFactoryDefaults() error {
-	err := m.call(RestoreMonitorFactoryDefaults)
+	err := m.call(procRestoreMonitorFactoryDefaults)
 	if err != nil {
 		return err
 	}
@@ -434,7 +471,7 @@ func (m *PhysicalMonitor) RestoreFactoryDefaults() error {
 // SaveCurrentMonitorSettings
 // Saves the current monitor settings to the display's nonvolatile storage.
 func (m *PhysicalMonitor) SaveCurrentMonitorSettings() error {
-	err := m.call(SaveCurrentMonitorSettings)
+	err := m.call(procSaveCurrentMonitorSettings)
 	if err != nil {
 		return err
 	}
@@ -452,7 +489,7 @@ func (m *PhysicalMonitor) SaveCurrentMonitorSettings() error {
 //
 // It is same as PhysicalMonitor.SetVCPFeature(vcp.Brightness. Value(value))
 func (m *PhysicalMonitor) SetBrightness(value int) error {
-	err := m.call(SetMonitorBrightness,
+	err := m.call(procSetMonitorBrightness,
 		uintptr(value),
 	)
 	if err != nil {
@@ -470,7 +507,7 @@ func (m *PhysicalMonitor) SetBrightness(value int) error {
 //
 // It is same as PhysicalMonitor.SetVCPFeature(vcp.Contrast. Value(value))
 func (m *PhysicalMonitor) SetContrast(value int) error {
-	err := m.call(SetMonitorContrast,
+	err := m.call(procSetMonitorContrast,
 		uintptr(value),
 	)
 	if err != nil {
@@ -486,12 +523,24 @@ func (m *PhysicalMonitor) SetContrast(value int) error {
 //
 // [out] pdwCapabilitiesStringLengthInCharacters
 // Receives the length of the capabilities string, in characters, including the terminating null character.
+//
+// The DDC/CI bus is unreliable right after the computer wakes from sleep; the
+// call is retried (up to 3 times, 100ms apart) before giving up.
 func (m *PhysicalMonitor) GetCapabilitiesStringLength() (size int, err error) {
-	err = m.call(GetCapabilitiesStringLength,
-		uintptr(unsafe.Pointer(&size)),
-	)
+	for attempt := range 3 {
+		if attempt > 0 {
+			time.Sleep(100 * time.Millisecond)
+		}
 
-	return
+		err = m.call(procGetCapabilitiesStringLength,
+			uintptr(unsafe.Pointer(&size)),
+		)
+		if err == nil {
+			return size, nil
+		}
+	}
+
+	return 0, err
 }
 
 // CapabilitiesRequestAndCapabilitiesReply
@@ -500,22 +549,34 @@ func (m *PhysicalMonitor) GetCapabilitiesStringLength() (size int, err error) {
 // [out] pszASCIICapabilitiesString
 // Pointer to a buffer that receives the monitor's capabilities string.
 // The caller must allocate this buffer.
+//
+// The DDC/CI bus is unreliable right after the computer wakes from sleep; the
+// call is retried (up to 5 times, 100ms apart) before giving up.
 func (m *PhysicalMonitor) CapabilitiesRequestAndCapabilitiesReply() (info string, err error) {
 	size, err := m.GetCapabilitiesStringLength()
-	if err != nil {
-		return
-	}
-
-	data := make([]byte, size)
-	err = m.call(CapabilitiesRequestAndCapabilitiesReply,
-		uintptr(unsafe.Pointer(&data[0])),
-		uintptr(size),
-	)
 	if err != nil {
 		return "", err
 	}
 
-	return string(data), nil
+	data := make([]byte, size)
+	for attempt := range 5 {
+		if attempt > 0 {
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		err = m.call(procCapabilitiesRequestAndCapabilitiesReply,
+			uintptr(unsafe.Pointer(&data[0])),
+			uintptr(size),
+		)
+		if err == nil {
+			if i := slices.Index(data, 0); i >= 0 {
+				data = data[:i]
+			}
+			return string(data), nil
+		}
+	}
+
+	return "", err
 }
 
 // TimingReport
@@ -550,7 +611,7 @@ type TimingReport struct {
 func (m *PhysicalMonitor) GetTimingReport() (*TimingReport, error) {
 	report := new(TimingReport)
 
-	err := m.call(GetTimingReport,
+	err := m.call(procGetTimingReport,
 		uintptr(unsafe.Pointer(report)),
 	)
 	if err != nil {
@@ -566,7 +627,7 @@ func (m *PhysicalMonitor) GetTimingReport() (*TimingReport, error) {
 // note:
 // This low-level function is identical to the high-level function SaveCurrentMonitorSettings.
 func (m *PhysicalMonitor) SaveCurrentSettings() error {
-	err := m.call(SaveCurrentSettings)
+	err := m.call(procSaveCurrentSettings)
 	if err != nil {
 		return err
 	}
