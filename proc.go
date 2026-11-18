@@ -9,6 +9,7 @@ const (
 	EnumDisplayMonitors = "EnumDisplayMonitors"
 	GetMonitorInfoA     = "GetMonitorInfoA"
 	GetMonitorInfoW     = "GetMonitorInfoW"
+	EnumDisplayDevicesW = "EnumDisplayDevicesW"
 )
 
 // See [microsoft-windows doc]
