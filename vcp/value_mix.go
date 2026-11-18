@@ -64,11 +64,15 @@ func (w windowPosition) BRY(value int) VCP { return VCP{code: _WindowPositionBRY
 // 调节显示器六轴饱和度
 type saturation struct{}
 
-func (s saturation) Red(value int) VCP     { return VCP{code: _SixAxisSaturationRed, value: value} }
-func (s saturation) Yellow(value int) VCP  { return VCP{code: _SixAxisSaturationYellow, value: value} }
-func (s saturation) Green(value int) VCP   { return VCP{code: _SixAxisSaturationGreen, value: value} }
-func (s saturation) Cyan(value int) VCP    { return VCP{code: _SixAxisSaturationCyan, value: value} }
-func (s saturation) Blue(value int) VCP    { return VCP{code: _SixAxisSaturationBlue, value: value} }
+func (s saturation) Red(value int) VCP    { return VCP{code: _SixAxisSaturationRed, value: value} }
+func (s saturation) Yellow(value int) VCP { return VCP{code: _SixAxisSaturationYellow, value: value} }
+
+func (s saturation) Green(value int) VCP { return VCP{code: _SixAxisSaturationGreen, value: value} }
+
+func (s saturation) Cyan(value int) VCP { return VCP{code: _SixAxisSaturationCyan, value: value} }
+
+func (s saturation) Blue(value int) VCP { return VCP{code: _SixAxisSaturationBlue, value: value} }
+
 func (s saturation) Magenta(value int) VCP { return VCP{code: _SixAxisSaturationMagenta, value: value} }
 
 // ======================= hueControl =======================
@@ -76,11 +80,15 @@ func (s saturation) Magenta(value int) VCP { return VCP{code: _SixAxisSaturation
 // 控制显示器色彩六轴色调
 type hueControl struct{}
 
-func (c hueControl) Red(value int) VCP     { return VCP{code: _SixAxisHueControlRed, value: value} }
-func (c hueControl) Yellow(value int) VCP  { return VCP{code: _SixAxisHueControlYellow, value: value} }
-func (c hueControl) Green(value int) VCP   { return VCP{code: _SixAxisHueControlGreen, value: value} }
-func (c hueControl) Cyan(value int) VCP    { return VCP{code: _SixAxisHueControlCyan, value: value} }
-func (c hueControl) Blue(value int) VCP    { return VCP{code: _SixAxisHueControlBlue, value: value} }
+func (c hueControl) Red(value int) VCP    { return VCP{code: _SixAxisHueControlRed, value: value} }
+func (c hueControl) Yellow(value int) VCP { return VCP{code: _SixAxisHueControlYellow, value: value} }
+
+func (c hueControl) Green(value int) VCP { return VCP{code: _SixAxisHueControlGreen, value: value} }
+
+func (c hueControl) Cyan(value int) VCP { return VCP{code: _SixAxisHueControlCyan, value: value} }
+
+func (c hueControl) Blue(value int) VCP { return VCP{code: _SixAxisHueControlBlue, value: value} }
+
 func (c hueControl) Magenta(value int) VCP { return VCP{code: _SixAxisHueControlMagenta, value: value} }
 
 // ======================= horizontal =======================

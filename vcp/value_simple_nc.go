@@ -720,6 +720,7 @@ func (tvChannelUpDown) DecrementChannel() VCP { return VCP{code: _TVChannelUpDow
 type audioMuteScreenBlank struct{}
 
 func (audioMuteScreenBlank) MuteTheAudio() VCP { return VCP{code: _AudioMuteScreenBlank, value: 0x01} }
+
 func (audioMuteScreenBlank) UnmuteTheAudio() VCP {
 	return VCP{code: _AudioMuteScreenBlank, value: 0x02}
 }
